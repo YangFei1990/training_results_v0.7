@@ -347,7 +347,7 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
                 #checkpointer=checkpointer,
                 cfg=cfg,
                 min_bbox_map=cfg.MLPERF.MIN_BBOX_MAP,
-                min_segm_map=cfg.MLPERF.MIN_SEGM_MAP)
+                min_segm_map=cfg.MLPERF.MIN_SEGM_MAP,
         )
     else:
         per_iter_callback_fn = None

@@ -95,8 +95,8 @@ def infer_batch(model, images, targets, image_ids, dataset, cfg):
     output = test(model, images)
     with torch.no_grad():
         #output = model(images)
+        output = [o.merge() for o in output]
         output = [o.to(cpu_device) for o in output]
-    output = [o.merge() for o in output]
     result_dict['masks'] = [prediction.get_field("mask").numpy() for prediction in output]
     result_dict['scores'] = [prediction.get_field("scores").numpy() for prediction in output]
     result_dict['labels'] = [prediction.get_field("labels").numpy() for prediction in output]
