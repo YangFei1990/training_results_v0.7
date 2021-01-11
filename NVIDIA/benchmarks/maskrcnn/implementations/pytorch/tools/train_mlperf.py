@@ -148,13 +148,17 @@ def mlperf_test_early_exit(iteration, iters_per_epoch, tester, model, data_loade
             if epoch == 17:
                 finished = 1
         synchronize()
-        if get_world_size() > 1:
+        if smp.size() > 1:
             with torch.no_grad():
                 finish_tensor = torch.tensor([finished], dtype=torch.int32, device = torch.device('cuda'))
                 if use_herring:
                     herring.broadcast(finish_tensor, 0)
                 else:
-                    torch.distributed.broadcast(finish_tensor, 0)
+                    #torch.distributed.broadcast(finish_tensor, 0)
+                    if is_main_process():
+                        smp.broadcast(finish_tensor, smp.WORLD)
+                    else:
+                        finish_tensor = smp.recv_from(0, smp.RankType.WORLD_RANK)
     
                 # If notified, end.
                 if finish_tensor.item() == 1:
@@ -333,17 +337,17 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
     # early exit each epoch
     if cfg.PER_EPOCH_EVAL:
         per_iter_callback_fn = functools.partial(
-                mlperf_checkpoint_early_exit,
+                mlperf_test_early_exit,
                 iters_per_epoch=iters_per_epoch,
                 # tester=functools.partial(test, cfg=cfg),
-                #tester=infer_coco_eval,
-                #model=model,
+                tester=infer_coco_eval,
+                model=model,
                 # distributed=distributed,
-                #data_loader=eval_data_loader,
-                checkpointer=checkpointer,
+                data_loader=eval_data_loader,
+                #checkpointer=checkpointer,
                 cfg=cfg,
-                #min_bbox_map=cfg.MLPERF.MIN_BBOX_MAP,
-                #min_segm_map=cfg.MLPERF.MIN_SEGM_MAP)
+                min_bbox_map=cfg.MLPERF.MIN_BBOX_MAP,
+                min_segm_map=cfg.MLPERF.MIN_SEGM_MAP)
         )
     else:
         per_iter_callback_fn = None
@@ -402,7 +406,14 @@ def main():
     args.distributed = num_gpus > 1
     # args.local_rank = get_local_rank()
 
-    smp.init()
+    smp_parameters = {
+    "partitions": 2,
+    "microbatches": 2,
+    "memory_weight": 1.0,
+    "ddp": True
+    }
+    
+    smp.init(smp_parameters)
 
     args.local_rank = smp.local_rank()
     torch.cuda.set_device(args.local_rank)
