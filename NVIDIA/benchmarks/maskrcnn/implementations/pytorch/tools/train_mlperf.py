@@ -301,8 +301,8 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
             cfg, model, optimizer, scheduler, output_dir, save_to_disk
         )
         arguments["save_checkpoints"] = cfg.SAVE_CHECKPOINTS
-        extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=True)
-        arguments.update(extra_checkpoint_data)
+        #extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=True)
+        #arguments.update(extra_checkpoint_data)
 
         def init_params(mod, opt):
             opt.init_master_params()
@@ -314,10 +314,11 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
             cfg, model, optimizer, scheduler, output_dir, save_to_disk
         )
         arguments["save_checkpoints"] = cfg.SAVE_CHECKPOINTS
-        extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=True)
-        arguments.update(extra_checkpoint_data)
+        #extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=True)
+        #arguments.update(extra_checkpoint_data)
 
-    checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=False)
+    extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=True)
+    arguments.update(extra_checkpoint_data)
 
     log_end(key=constants.INIT_STOP)
     barrier()
@@ -343,7 +344,12 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
 
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
-    iters_per_epoch = 2000
+    #model.eval()
+    #infer_coco_eval(model, eval_data_loader, cfg)
+    #synchronize()
+    #return
+
+    iters_per_epoch = 2002
     # set the callback function to evaluate and potentially
     # early exit each epoch
     if cfg.PER_EPOCH_EVAL:
@@ -446,13 +452,18 @@ def main():
         #        backend="nccl", init_method="env://"
         #    )
         # setting seeds - needs to be timed, so after RUN_START
-        if is_main_process():
+        #if is_main_process():
+        if smp.dp_rank() == 0:
             master_seed = random.SystemRandom().randint(0, 2 ** 32 - 1)
             seed_tensor = torch.tensor(master_seed, dtype=torch.float32, device=torch.device("cuda"))
         else:
             seed_tensor = torch.tensor(0, dtype=torch.float32, device=torch.device("cuda"))
 
-        broadcast(seed_tensor, 0)
+        #broadcast(seed_tensor, 0)
+        if smp.dp_rank() == 0:
+            smp.broadcast(seed_tensor, smp.DP_GROUP)
+        else:
+            seed_tensor = smp.recv_from(0, smp.RankType.DP_RANK)
         master_seed = int(seed_tensor.item())
     else:
         # random master seed, random.SystemRandom() uses /dev/urandom on Unix

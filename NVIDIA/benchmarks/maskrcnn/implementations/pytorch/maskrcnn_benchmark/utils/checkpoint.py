@@ -192,7 +192,10 @@ class Checkpointer(object):
             f.write(last_filename)
 
     def _load_file(self, f, load_partial):
-        fname = f + "_" + str(smp.mp_rank())
+        if load_partial:
+            fname = f + "_" + str(smp.mp_rank())
+        else:
+            fname = f
         return smp.load(fname, partial=load_partial)
 
     def _load_model(self, checkpoint, nhwc):
