@@ -339,9 +339,11 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
         random_number_generator=random_number_generator,
     )[0]
     log_event(key=constants.TRAIN_SAMPLES, value=len(data_loader))
+    log_event(key=constants.EVAL_SAMPLES, value=len(eval_data_loader))
 
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
+    iters_per_epoch = 2000
     # set the callback function to evaluate and potentially
     # early exit each epoch
     if cfg.PER_EPOCH_EVAL:
@@ -365,6 +367,7 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
 
     success = do_train(
         model,
+        iters_per_epoch,
         data_loader,
         optimizer,
         scheduler,

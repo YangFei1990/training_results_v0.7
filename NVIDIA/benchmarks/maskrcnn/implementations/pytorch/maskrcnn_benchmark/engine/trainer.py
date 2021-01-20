@@ -61,6 +61,7 @@ def forward_backward(model, optimizer, images, targets):
 
 def do_train(
     model,
+    iters_per_epoch,
     data_loader,
     optimizer,
     scheduler,
@@ -159,7 +160,7 @@ def do_train(
                 meters.delimiter.join(
                     [
                         "eta: {eta}",
-                        "iter: {iter}",
+                        "iter: {iter}/{iters_per_epoch}",
                         "throughput: {throughput} img/sec",
                         "{meters}",
                         "lr: {lr:.6f}",
@@ -168,6 +169,7 @@ def do_train(
                 ).format(
                     eta=eta_string,
                     iter=iteration,
+                    iters_per_epoch=iters_per_epoch,
                     meters=str(meters),
                     throughput=meters.throughput.global_avg,
                     lr=optimizer.param_groups[0]["lr"],
