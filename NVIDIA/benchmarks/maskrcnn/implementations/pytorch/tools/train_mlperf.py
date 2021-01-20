@@ -233,7 +233,65 @@ def cast_frozen_bn_to_half(module):
     return module
 
 
-def train(cfg, local_rank, distributed, random_number_generator=None):
+@smp.step
+def forward_backward(model, optimizer, images, targets, backward=False):
+    loss_dict = model(images, targets)
+    if backward:
+        losses = sum(loss for loss in loss_dict.values())
+        optimizer.backward(losses)
+    return loss_dict
+
+def one_step_run_test(model, optimizer, data_loader, device, backward=False):
+    model.train()
+    def prefetcher(load_iterator):
+        prefetch_stream = torch.cuda.Stream()
+        pad_batches = []
+
+        def _prefetch():
+            try:
+                # I'm not sure why the trailing _ is necessary but the reference used
+                # "for i, (images, targets, _) in enumerate(data_loader):" so I'll keep it.
+                images, targets, _ = next(load_iterator)
+            except StopIteration:
+                return None, None
+
+            with torch.cuda.stream(prefetch_stream):
+                # TODO:  I'm not sure if the dataloader knows how to pin the targets' datatype.
+                targets = [target.to(device, non_blocking=True) for target in targets]
+                images = images.to(device, non_blocking=True)
+
+            return images, targets
+
+        next_images, next_targets = _prefetch()
+
+        while next_images is not None:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
+            current_images, current_targets = next_images, next_targets
+            next_images, next_targets = _prefetch()
+            yield current_images, current_targets
+
+    class Targets:
+        def __init__(self, targ):
+            self.targets = targ
+        def smp_slice(self, num_mb, mb, axis):
+            slice_size = len(self.targets) // num_mb
+            return self.targets[mb*slice_size : (mb+1)*slice_size]
+
+    torch.cuda.set_device(torch.device("cuda", smp.local_rank()))
+    synchronize()
+    optimizer.zero_grad()
+
+    for iteration, (images, targets) in enumerate(prefetcher(iter(data_loader)), 0):
+        images = images.to(device)
+        targets = [target.to(device) for target in targets]
+        loss_dict = forward_backward(model, optimizer, images, Targets(targets), backward=backward)
+        loss_dict = {k: v.reduce_mean() for k, v in loss_dict.items()}
+        losses = sum(loss for loss in loss_dict.values())
+        print(f"mp_rank {smp.mp_rank()} dp_rank() {smp.dp_rank()} loss dict {loss_dict}, total loss {losses}")
+        break
+
+
+def train(cfg, local_rank, distributed, random_number_generator=None, one_step_test=False):
     if (torch._C, '_jit_set_profiling_executor') :
         torch._C._jit_set_profiling_executor(False)
     if (torch._C, '_jit_set_profiling_mode') :
@@ -344,10 +402,13 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
 
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
-    #model.eval()
-    #infer_coco_eval(model, eval_data_loader, cfg)
-    #synchronize()
-    #return
+    if one_step_test:
+        one_step_run_test(model, optimizer, data_loader, device, backward=False)
+        synchronize()
+        model.eval()
+        infer_coco_eval(model, eval_data_loader, cfg)
+        synchronize()
+        return model, True
 
     iters_per_epoch = 2002
     # set the callback function to evaluate and potentially
@@ -454,7 +515,7 @@ def main():
         # setting seeds - needs to be timed, so after RUN_START
         #if is_main_process():
         if smp.dp_rank() == 0:
-            master_seed = random.SystemRandom().randint(0, 2 ** 32 - 1)
+            master_seed = 1234#random.SystemRandom().randint(0, 2 ** 32 - 1)
             seed_tensor = torch.tensor(master_seed, dtype=torch.float32, device=torch.device("cuda"))
         else:
             seed_tensor = torch.tensor(0, dtype=torch.float32, device=torch.device("cuda"))
@@ -511,7 +572,7 @@ def main():
     # Initialise async eval
     init()
 
-    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator)
+    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator=random_number_generator, one_step_test=False)
 
     if success is not None:
         if success:
