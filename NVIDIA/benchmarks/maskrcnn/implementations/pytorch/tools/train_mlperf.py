@@ -441,10 +441,10 @@ def main():
     #     constants.LOGGER.addHandler(constants._FILE_HANDLER)
     if args.distributed:
         torch.cuda.set_device(args.local_rank)
-        if not use_herring:
-            torch.distributed.init_process_group(
-                backend="nccl", init_method="env://"
-            )
+        #if not use_herring:
+        #    torch.distributed.init_process_group(
+        #        backend="nccl", init_method="env://"
+        #    )
         # setting seeds - needs to be timed, so after RUN_START
         if is_main_process():
             master_seed = random.SystemRandom().randint(0, 2 ** 32 - 1)
