@@ -414,8 +414,8 @@ def main():
     args = parser.parse_args()
 
     #num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else get_world_size()
-    num_gpus = 1
-    args.distributed = num_gpus > 1
+    # num_gpus = 1
+    # args.distributed = num_gpus > 1
     # args.local_rank = get_local_rank()
 
     smp_parameters = {
@@ -426,6 +426,9 @@ def main():
     }
     
     smp.init(smp_parameters)
+    
+    num_gpus = smp.size()
+    args.distributed = smp.dp_size() > 1
 
     args.local_rank = smp.local_rank()
     torch.cuda.set_device(args.local_rank)
@@ -470,7 +473,7 @@ def main():
         mkdir(output_dir)
 
     logger = setup_logger("maskrcnn_benchmark", output_dir, get_rank())
-    logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("Using {} GPUs".format(smp.size()))
     logger.info(args)
 
     # generate worker seeds, one seed for every distributed worker
