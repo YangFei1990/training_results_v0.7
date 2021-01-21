@@ -234,6 +234,52 @@ def cast_frozen_bn_to_half(module):
 
 
 @smp.step
+def test(model, images):
+    with torch.no_grad():
+        output = model(images)
+    return output
+
+def infer_batch(model, images, targets, image_ids, dataset, cfg):
+    device = torch.device(cfg.MODEL.DEVICE)
+    cpu_device = torch.device("cpu")
+    result_dict = {}
+    images = images.to(device)
+    output = test(model, images)
+    with torch.no_grad():
+        #output = model(images)
+        merged_output = []
+        for o in output:
+            merged_output.extend(o)
+        #output = [o.merge() for o in output]
+        output = [o.to(cpu_device) for o in merged_output]
+    result_dict['masks'] = [prediction.get_field("mask").numpy() for prediction in output]
+    result_dict['scores'] = [prediction.get_field("scores").numpy() for prediction in output]
+    result_dict['labels'] = [prediction.get_field("labels").numpy() for prediction in output]
+    result_dict['mapped_labels'] = [[dataset.contiguous_category_id_to_json_id[i] \
+                                     for i in labels] for labels in result_dict['labels']]
+    result_dict['img_info'] = [dataset.get_img_info(image_id) for image_id in image_ids]
+    output = [prediction.resize((img_info['width'], img_info['height'])) for img_info, prediction in zip(result_dict['img_info'], output)]
+    result_dict['boxes'] = [prediction.bbox.numpy() for prediction in output]
+    output = [prediction.convert("xywh") for prediction in output]
+    result_dict['boxes_wh'] = [prediction.bbox.numpy() for prediction in output]
+    return output, result_dict
+
+def one_step_eval_test(model, data_loader, cfg):
+    import numpy as np
+    model.eval()
+    eval_iterator = iter(data_loader)
+    for images, targets, image_ids in eval_iterator:
+        print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} image_ids {image_ids}")
+        output, res = infer_batch(model, images, targets, image_ids, data_loader.dataset, cfg)
+        for key, val in res.items():
+            if key != "mapped_labels" and key != "img_info":
+                res[key] = [np.sum(k) for k in val]
+        del res["mapped_labels"]
+        del res["img_info"]
+        print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {output}, res {res}")
+        break
+    
+@smp.step
 def forward_backward(model, optimizer, images, targets, backward=False):
     loss_dict = model(images, targets)
     if backward:
@@ -405,9 +451,11 @@ def train(cfg, local_rank, distributed, random_number_generator=None, one_step_t
     if one_step_test:
         one_step_run_test(model, optimizer, data_loader, device, backward=False)
         synchronize()
-        model.eval()
-        infer_coco_eval(model, eval_data_loader, cfg)
+        one_step_eval_test(model, eval_data_loader, cfg)
         synchronize()
+        #model.eval()
+        #infer_coco_eval(model, eval_data_loader, cfg)
+        #synchronize()
         return model, True
 
     iters_per_epoch = 2002
@@ -507,7 +555,7 @@ def main():
     #     constants._FILE_HANDLER.setLevel(logging.DEBUG)
     #     constants.LOGGER.addHandler(constants._FILE_HANDLER)
     if args.distributed:
-        torch.cuda.set_device(args.local_rank)
+        # torch.cuda.set_device(args.local_rank)
         #if not use_herring:
         #    torch.distributed.init_process_group(
         #        backend="nccl", init_method="env://"
