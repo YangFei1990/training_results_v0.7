@@ -248,9 +248,13 @@ def infer_batch(model, images, targets, image_ids, dataset, cfg):
     with torch.no_grad():
         #output = model(images)
         merged_output = []
+        mb = len(output[0])
+        mb_outputs = [[] for _ in range(mb)]
         for o in output:
-            merged_output.extend(o)
-        #output = [o.merge() for o in output]
+            for i in range(mb):
+                mb_outputs[i].append(o[i])
+        for out in mb_outputs:
+            merged_output.extend(out)
         output = [o.to(cpu_device) for o in merged_output]
     result_dict['masks'] = [prediction.get_field("mask").numpy() for prediction in output]
     result_dict['scores'] = [prediction.get_field("scores").numpy() for prediction in output]
@@ -275,8 +279,13 @@ def one_step_eval_test(model, data_loader, cfg):
             if key != "mapped_labels" and key != "img_info":
                 res[key] = [np.sum(k) for k in val]
         del res["mapped_labels"]
-        del res["img_info"]
-        print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {output}, res {res}")
+        #del res["img_info"]
+        #print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {output}, res {res}")
+        for out in output:
+            print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {out}")
+        for key, val in res.items():
+            for item in val:
+                print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} res {key} total {len(val)} item {item}")
         break
     
 @smp.step
@@ -451,11 +460,11 @@ def train(cfg, local_rank, distributed, random_number_generator=None, one_step_t
     if one_step_test:
         one_step_run_test(model, optimizer, data_loader, device, backward=False)
         synchronize()
-        one_step_eval_test(model, eval_data_loader, cfg)
-        synchronize()
-        #model.eval()
-        #infer_coco_eval(model, eval_data_loader, cfg)
+        #one_step_eval_test(model, eval_data_loader, cfg)
         #synchronize()
+        model.eval()
+        infer_coco_eval(model, eval_data_loader, cfg)
+        synchronize()
         return model, True
 
     iters_per_epoch = 2002
@@ -620,7 +629,7 @@ def main():
     # Initialise async eval
     init()
 
-    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator=random_number_generator, one_step_test=False)
+    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator=random_number_generator, one_step_test=True)
 
     if success is not None:
         if success:
