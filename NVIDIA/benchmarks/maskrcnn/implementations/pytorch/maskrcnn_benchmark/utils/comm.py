@@ -62,7 +62,8 @@ def get_rank():
 
 
 def is_main_process():
-    smp.barrier()
+    #smp.barrier()
+    return smp.rank() == 0
 
     #if run_herring:
     #    herring.barrier()

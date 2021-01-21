@@ -148,13 +148,17 @@ def mlperf_test_early_exit(iteration, iters_per_epoch, tester, model, data_loade
             if epoch == 17:
                 finished = 1
         synchronize()
-        if get_world_size() > 1:
+        if smp.size() > 1:
             with torch.no_grad():
                 finish_tensor = torch.tensor([finished], dtype=torch.int32, device = torch.device('cuda'))
                 if use_herring:
                     herring.broadcast(finish_tensor, 0)
                 else:
-                    torch.distributed.broadcast(finish_tensor, 0)
+                    #torch.distributed.broadcast(finish_tensor, 0)
+                    if is_main_process():
+                        smp.broadcast(finish_tensor, smp.WORLD)
+                    else:
+                        finish_tensor = smp.recv_from(0, smp.RankType.WORLD_RANK)
     
                 # If notified, end.
                 if finish_tensor.item() == 1:
@@ -229,7 +233,120 @@ def cast_frozen_bn_to_half(module):
     return module
 
 
-def train(cfg, local_rank, distributed, random_number_generator=None):
+@smp.step
+def test(model, images):
+    with torch.no_grad():
+        output = model(images)
+    return output
+
+def infer_batch(model, images, targets, image_ids, dataset, cfg):
+    device = torch.device(cfg.MODEL.DEVICE)
+    cpu_device = torch.device("cpu")
+    result_dict = {}
+    images = images.to(device)
+    output = test(model, images)
+    with torch.no_grad():
+        #output = model(images)
+        merged_output = []
+        mb = len(output[0])
+        mb_outputs = [[] for _ in range(mb)]
+        for o in output:
+            for i in range(mb):
+                mb_outputs[i].append(o[i])
+        for out in mb_outputs:
+            merged_output.extend(out)
+        output = [o.to(cpu_device) for o in merged_output]
+    result_dict['masks'] = [prediction.get_field("mask").numpy() for prediction in output]
+    result_dict['scores'] = [prediction.get_field("scores").numpy() for prediction in output]
+    result_dict['labels'] = [prediction.get_field("labels").numpy() for prediction in output]
+    result_dict['mapped_labels'] = [[dataset.contiguous_category_id_to_json_id[i] \
+                                     for i in labels] for labels in result_dict['labels']]
+    result_dict['img_info'] = [dataset.get_img_info(image_id) for image_id in image_ids]
+    output = [prediction.resize((img_info['width'], img_info['height'])) for img_info, prediction in zip(result_dict['img_info'], output)]
+    result_dict['boxes'] = [prediction.bbox.numpy() for prediction in output]
+    output = [prediction.convert("xywh") for prediction in output]
+    result_dict['boxes_wh'] = [prediction.bbox.numpy() for prediction in output]
+    return output, result_dict
+
+def one_step_eval_test(model, data_loader, cfg):
+    import numpy as np
+    model.eval()
+    eval_iterator = iter(data_loader)
+    for images, targets, image_ids in eval_iterator:
+        print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} image_ids {image_ids}")
+        output, res = infer_batch(model, images, targets, image_ids, data_loader.dataset, cfg)
+        for key, val in res.items():
+            if key != "mapped_labels" and key != "img_info":
+                res[key] = [np.sum(k) for k in val]
+        del res["mapped_labels"]
+        #del res["img_info"]
+        #print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {output}, res {res}")
+        for out in output:
+            print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} output {out}")
+        for key, val in res.items():
+            for item in val:
+                print(f"mp_rank {smp.mp_rank()} dp_rank {smp.dp_rank()} res {key} total {len(val)} item {item}")
+        break
+    
+@smp.step
+def forward_backward(model, optimizer, images, targets, backward=False):
+    loss_dict = model(images, targets)
+    if backward:
+        losses = sum(loss for loss in loss_dict.values())
+        optimizer.backward(losses)
+    return loss_dict
+
+def one_step_run_test(model, optimizer, data_loader, device, backward=False):
+    model.train()
+    def prefetcher(load_iterator):
+        prefetch_stream = torch.cuda.Stream()
+        pad_batches = []
+
+        def _prefetch():
+            try:
+                # I'm not sure why the trailing _ is necessary but the reference used
+                # "for i, (images, targets, _) in enumerate(data_loader):" so I'll keep it.
+                images, targets, _ = next(load_iterator)
+            except StopIteration:
+                return None, None
+
+            with torch.cuda.stream(prefetch_stream):
+                # TODO:  I'm not sure if the dataloader knows how to pin the targets' datatype.
+                targets = [target.to(device, non_blocking=True) for target in targets]
+                images = images.to(device, non_blocking=True)
+
+            return images, targets
+
+        next_images, next_targets = _prefetch()
+
+        while next_images is not None:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
+            current_images, current_targets = next_images, next_targets
+            next_images, next_targets = _prefetch()
+            yield current_images, current_targets
+
+    class Targets:
+        def __init__(self, targ):
+            self.targets = targ
+        def smp_slice(self, num_mb, mb, axis):
+            slice_size = len(self.targets) // num_mb
+            return self.targets[mb*slice_size : (mb+1)*slice_size]
+
+    torch.cuda.set_device(torch.device("cuda", smp.local_rank()))
+    synchronize()
+    optimizer.zero_grad()
+
+    for iteration, (images, targets) in enumerate(prefetcher(iter(data_loader)), 0):
+        images = images.to(device)
+        targets = [target.to(device) for target in targets]
+        loss_dict = forward_backward(model, optimizer, images, Targets(targets), backward=backward)
+        loss_dict = {k: v.reduce_mean() for k, v in loss_dict.items()}
+        losses = sum(loss for loss in loss_dict.values())
+        print(f"mp_rank {smp.mp_rank()} dp_rank() {smp.dp_rank()} loss dict {loss_dict}, total loss {losses}")
+        break
+
+
+def train(cfg, local_rank, distributed, random_number_generator=None, one_step_test=False):
     if (torch._C, '_jit_set_profiling_executor') :
         torch._C._jit_set_profiling_executor(False)
     if (torch._C, '_jit_set_profiling_mode') :
@@ -245,7 +362,6 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
     #device = torch.device(cfg.MODEL.DEVICE)
     #model.to(device)
 
-    optimizer = make_optimizer(cfg, model)
 
     # Initialize mixed-precision training
     is_fp16 = (cfg.DTYPE == "float16")
@@ -253,6 +369,7 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
         # convert model to FP16
         model.half()
 
+    optimizer = make_optimizer(cfg, model)
     # Optimizer logging
     log_event(key=constants.OPT_NAME, value=cfg.SOLVER.OPTIMIZER)
     log_event(key=constants.OPT_BASE_LR, value=cfg.SOLVER.BASE_LR)
@@ -281,30 +398,40 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
     arguments["global_batch_size"] = cfg.SOLVER.IMS_PER_BATCH
     output_dir = cfg.OUTPUT_DIR
 
-    save_to_disk = get_rank() == 0
-    checkpointer = DetectronCheckpointer(
-        cfg, model, optimizer, scheduler, output_dir, save_to_disk
-    )
-    arguments["save_checkpoints"] = cfg.SAVE_CHECKPOINTS
-    
-    extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC)
-    arguments.update(extra_checkpoint_data)
-    
+
     if is_fp16:
         #import apex
-        from fp16.fp16 import FP16_Optimizer
+        from maskrcnn_benchmark.fp16.fp16 import FP16_Optimizer
         #optimizer = apex.fp16_utils.fp16_optimizer.FP16_Optimizer(model, optimizer, dynamic_loss_scale=True)
         dynamic_loss_args = {'scale_window': 1000,
                              'min_scale': 1,
                              'delayed_shift': 2}
 
-        #optimizer = smp.DistributedOptimizer(optimizer)
         optimizer = smp.DistributedOptimizer(FP16_Optimizer(model, optimizer, dynamic_loss_scale=True, dynamic_loss_args=dynamic_loss_args ))
+
+        save_to_disk = get_rank() == 0
+        checkpointer = DetectronCheckpointer(
+            cfg, model, optimizer, scheduler, output_dir, save_to_disk
+        )
+        arguments["save_checkpoints"] = cfg.SAVE_CHECKPOINTS
+        #extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=True)
+        #arguments.update(extra_checkpoint_data)
 
         def init_params(mod, opt):
             opt.init_master_params()
 
         model.register_post_partition_hook(init_params)
+    else:
+        save_to_disk = get_rank() == 0
+        checkpointer = DetectronCheckpointer(
+            cfg, model, optimizer, scheduler, output_dir, save_to_disk
+        )
+        arguments["save_checkpoints"] = cfg.SAVE_CHECKPOINTS
+        #extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=True)
+        #arguments.update(extra_checkpoint_data)
+
+    extra_checkpoint_data = checkpointer.load(cfg.MODEL.WEIGHT, cfg.NHWC, load_partial=False, model_only=True)
+    arguments.update(extra_checkpoint_data)
 
     log_end(key=constants.INIT_STOP)
     barrier()
@@ -326,24 +453,36 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
         random_number_generator=random_number_generator,
     )[0]
     log_event(key=constants.TRAIN_SAMPLES, value=len(data_loader))
+    log_event(key=constants.EVAL_SAMPLES, value=len(eval_data_loader))
 
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
+    if one_step_test:
+        one_step_run_test(model, optimizer, data_loader, device, backward=False)
+        synchronize()
+        #one_step_eval_test(model, eval_data_loader, cfg)
+        #synchronize()
+        model.eval()
+        infer_coco_eval(model, eval_data_loader, cfg)
+        synchronize()
+        return model, True
+
+    iters_per_epoch = 2002
     # set the callback function to evaluate and potentially
     # early exit each epoch
     if cfg.PER_EPOCH_EVAL:
         per_iter_callback_fn = functools.partial(
-                mlperf_checkpoint_early_exit,
+                mlperf_test_early_exit,
                 iters_per_epoch=iters_per_epoch,
                 # tester=functools.partial(test, cfg=cfg),
-                #tester=infer_coco_eval,
-                #model=model,
+                tester=infer_coco_eval,
+                model=model,
                 # distributed=distributed,
-                #data_loader=eval_data_loader,
-                checkpointer=checkpointer,
+                data_loader=eval_data_loader,
+                #checkpointer=checkpointer,
                 cfg=cfg,
-                #min_bbox_map=cfg.MLPERF.MIN_BBOX_MAP,
-                #min_segm_map=cfg.MLPERF.MIN_SEGM_MAP)
+                min_bbox_map=cfg.MLPERF.MIN_BBOX_MAP,
+                min_segm_map=cfg.MLPERF.MIN_SEGM_MAP,
         )
     else:
         per_iter_callback_fn = None
@@ -352,6 +491,7 @@ def train(cfg, local_rank, distributed, random_number_generator=None):
 
     success = do_train(
         model,
+        iters_per_epoch,
         data_loader,
         optimizer,
         scheduler,
@@ -398,11 +538,21 @@ def main():
     args = parser.parse_args()
 
     #num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else get_world_size()
-    num_gpus = 1
-    args.distributed = num_gpus > 1
+    # num_gpus = 1
+    # args.distributed = num_gpus > 1
     # args.local_rank = get_local_rank()
 
-    smp.init()
+    smp_parameters = {
+    "partitions": 2,
+    "microbatches": 2,
+    "memory_weight": 1.0,
+    "ddp": True
+    }
+    
+    smp.init(smp_parameters)
+    
+    num_gpus = smp.size()
+    args.distributed = smp.dp_size() > 1
 
     args.local_rank = smp.local_rank()
     torch.cuda.set_device(args.local_rank)
@@ -414,19 +564,24 @@ def main():
     #     constants._FILE_HANDLER.setLevel(logging.DEBUG)
     #     constants.LOGGER.addHandler(constants._FILE_HANDLER)
     if args.distributed:
-        torch.cuda.set_device(args.local_rank)
-        if not use_herring:
-            torch.distributed.init_process_group(
-                backend="nccl", init_method="env://"
-            )
+        # torch.cuda.set_device(args.local_rank)
+        #if not use_herring:
+        #    torch.distributed.init_process_group(
+        #        backend="nccl", init_method="env://"
+        #    )
         # setting seeds - needs to be timed, so after RUN_START
-        if is_main_process():
-            master_seed = random.SystemRandom().randint(0, 2 ** 32 - 1)
+        #if is_main_process():
+        if smp.dp_rank() == 0:
+            master_seed = 1234#random.SystemRandom().randint(0, 2 ** 32 - 1)
             seed_tensor = torch.tensor(master_seed, dtype=torch.float32, device=torch.device("cuda"))
         else:
             seed_tensor = torch.tensor(0, dtype=torch.float32, device=torch.device("cuda"))
 
-        broadcast(seed_tensor, 0)
+        #broadcast(seed_tensor, 0)
+        if smp.dp_rank() == 0:
+            smp.broadcast(seed_tensor, smp.DP_GROUP)
+        else:
+            seed_tensor = smp.recv_from(0, smp.RankType.DP_RANK)
         master_seed = int(seed_tensor.item())
     else:
         # random master seed, random.SystemRandom() uses /dev/urandom on Unix
@@ -447,7 +602,7 @@ def main():
         mkdir(output_dir)
 
     logger = setup_logger("maskrcnn_benchmark", output_dir, get_rank())
-    logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("Using {} GPUs".format(smp.size()))
     logger.info(args)
 
     # generate worker seeds, one seed for every distributed worker
@@ -474,7 +629,7 @@ def main():
     # Initialise async eval
     init()
 
-    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator)
+    model, success = train(cfg, args.local_rank, args.distributed, random_number_generator=random_number_generator, one_step_test=True)
 
     if success is not None:
         if success:
